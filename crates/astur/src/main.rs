@@ -1592,6 +1592,10 @@ unsafe extern "system" fn marker_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM
     } else if msg != 0 && msg == TASKBAR_CREATED_MSG.load(Ordering::Relaxed) {
         // Explorer (re)started: the wallpaper window is a new one.
         wp_explorer_restarted();
+        taskbars_sync();
+    } else if msg == WM_TIMER && w.0 == TASKBAR_TIMER_ID {
+        taskbars_sync();
+        return LRESULT(0);
     } else if msg == WM_REBUILD_BARS {
         // The deferred rebuild, running on a clean stack.
         BARS_REBUILD_PENDING.store(false, Ordering::Relaxed);
@@ -1600,6 +1604,7 @@ unsafe extern "system" fn marker_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM
             // not the work area, so nothing here moves; the manager re-reads
             // the work areas and does nothing if none changed.
             push_cmd(Cmd::RefreshWorkAreas);
+            taskbars_sync();
             return LRESULT(0);
         }
         seed_fullscreen_windows();
@@ -1609,6 +1614,7 @@ unsafe extern "system" fn marker_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM
         bar_icons_retire();
         bar_icons_sweep();
         ensure_bars();
+        taskbars_sync();
         push_cmd(Cmd::RefreshMonitors);
         return LRESULT(0);
     } else if msg == WM_TAB_BARS {
@@ -1629,8 +1635,10 @@ unsafe extern "system" fn marker_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM
         } else {
             for b in BARS.lock().unwrap().iter() {
                 let _ = ShowWindow(hwnd_from(b.hwnd), SW_HIDE);
+                barhit_publish(b.hwnd, None);
             }
         }
+        taskbars_configure(h);
     } else if msg == WM_REARM_HOOKS && !EXITING.load(Ordering::Relaxed) {
         // Watchdog says the OS dropped our hooks. Re-install on this thread —
         // low-level hooks belong to the thread that pumps their messages.
@@ -1663,6 +1671,7 @@ unsafe extern "system" fn marker_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM
         // A maximized/fullscreen app entered or left one monitor. Rebuild only
         // bar runtime geometry; manager/window layout must not disturb the app.
         ensure_bars();
+        taskbars_sync();
         // Tab bars hide over a fullscreen shown tab (see tab_bars_sync).
         tab_bars_sync();
     }
@@ -2786,6 +2795,20 @@ struct BarWin {
     hmon: isize,
 }
 static BARS: Mutex<Vec<BarWin>> = Mutex::new(Vec::new());
+static TASKBAR_WORKSPACES: AtomicBool = AtomicBool::new(false);
+static TASKBAR_OFFSET: AtomicI32 = AtomicI32::new(0);
+const TASKBAR_TIMER_ID: usize = 20;
+const TASKBAR_HEIGHT: i32 = 28;
+const TASKBAR_PAD: i32 = 4;
+
+struct TaskbarWin {
+    bar: BarWin,
+    rect: Option<RECT>,
+    error: Option<&'static str>,
+}
+// Main-thread windows, separate from BARS so disabling the top bar cannot
+// disable workspace publication or reserve any extra tiling space.
+static TASKBARS: Mutex<Vec<TaskbarWin>> = Mutex::new(Vec::new());
 // HINSTANCE stashed so the display-change handler can create bars for new monitors.
 static BAR_HINST: AtomicIsize = AtomicIsize::new(0);
 // Bar geometry, set at startup so ensure_bars works without a Config in hand.
@@ -2858,7 +2881,7 @@ static FULLSCREEN_WINDOWS: Mutex<Option<HashMap<isize, isize>>> = Mutex::new(Non
 // Hook-visible bar hit rects, lock-free (the mouse hook may not take locks).
 // Slot i is bar i's on-screen rect while it accepts wheel input; hwnd 0 = empty.
 // BARS_HOT short-circuits the whole check to one atomic load when idle.
-const MAX_BARS: usize = 8;
+const MAX_BARS: usize = 16; // top bar + taskbar strip on up to eight monitors
 static BARS_HOT: AtomicBool = AtomicBool::new(false);
 /// One-shot guard so an overflowing bar array reports itself exactly once.
 static BARHIT_FULL_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -3429,6 +3452,7 @@ fn bar_style(cfg: &Config, r: &config::BarRoles) -> BarStyle {
 /// Everything the bars paint. Replaced wholesale by the manager each update.
 #[derive(Clone)]
 struct BarData {
+    taskbar: bool,
     bg: u32,
     fg: u32,
     accent: u32,
@@ -3471,6 +3495,7 @@ struct BarData {
 impl BarData {
     fn new() -> Self {
         BarData {
+            taskbar: false,
             bg: 0x00261B1A,
             fg: 0x00F5CAC0,
             accent: 0x00FFAA66,
@@ -5037,6 +5062,7 @@ const BLOCK_CLASSES: &[&str] = &[
     "Default IME",
     "astur_marker",
     "astur_bar",
+    "astur_taskbar",
     "astur_slide",
     "astur_tabs",
 ];
@@ -13576,6 +13602,35 @@ unsafe fn process_strip(mgr: &mut Manager, cmd: &Cmd) -> bool {
 // Status bar (waybar-style): workspace pills + focused title + clock.
 // =========================================================================
 
+unsafe fn bar_class(
+    hinst: HINSTANCE,
+    background: windows::Win32::Graphics::Gdi::HBRUSH,
+    taskbar: bool,
+) -> WNDCLASSW {
+    use windows::Win32::UI::WindowsAndMessaging::{LoadCursorW, IDC_ARROW};
+    let cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_else(|e| {
+        log_error!("could not load the workspace controls' arrow cursor: {e}");
+        Default::default()
+    });
+    WNDCLASSW {
+        lpfnWndProc: if taskbar {
+            Some(taskbar_wndproc)
+        } else {
+            Some(bar_wndproc)
+        },
+        hInstance: hinst,
+        hbrBackground: background,
+        // A null class cursor leaves the previous app/startup cursor in place.
+        hCursor: cursor,
+        lpszClassName: if taskbar {
+            w!("astur_taskbar")
+        } else {
+            w!("astur_bar")
+        },
+        ..Default::default()
+    }
+}
+
 /// Read a window's title into a String.
 unsafe fn window_title(h: HWND) -> String {
     let mut buf = [0u16; 256];
@@ -14168,6 +14223,266 @@ unsafe fn ensure_bars_inner() {
         }
     }
     BARS_HOT.store(!bars.is_empty(), Ordering::Relaxed);
+}
+
+/// A separate workspace-only view of the manager's snapshot. Fixed-width
+/// labels keep the overlay predictable; app icons stay on the full bar.
+fn taskbar_data(mut data: BarData) -> BarData {
+    data.taskbar = true;
+    data.left = vec![BarWidget::Workspaces];
+    data.center.clear();
+    data.right.clear();
+    data.style.shape = BarShape::Strip;
+    data.style.border_w = 0;
+    data.ws_fit = false;
+    data.icon_font = false;
+    data.style.title_bold = false;
+    for m in &mut data.mons {
+        m.ws_icons.clear();
+    }
+    data
+}
+
+/// Fit wholly inside a revealed horizontal taskbar, never over the tray.
+/// None means auto-hidden/off-screen. Err means a user-adjustable placement
+/// cannot fit; never show a clipped list with unreachable workspace buttons.
+fn taskbar_strip_rect(
+    monitor: RECT,
+    taskbar: RECT,
+    tray_left: i32,
+    offset: i32,
+    count: usize,
+    cell: i32,
+    dpi: u32,
+) -> Result<Option<RECT>, &'static str> {
+    let height = taskbar.bottom - taskbar.top;
+    if height <= 0 || taskbar.right <= taskbar.left {
+        return Ok(None);
+    }
+    if taskbar.right - taskbar.left <= height {
+        return Err("vertical taskbars are not supported");
+    }
+    let top = taskbar.top.max(monitor.top);
+    let bottom = taskbar.bottom.min(monitor.bottom);
+    if bottom - top < height - 2 || bottom - top < dpi_px(16, dpi) {
+        return Ok(None);
+    }
+    let pad = dpi_px(TASKBAR_PAD, dpi);
+    let left = taskbar.left.max(monitor.left) + dpi_px(offset, dpi);
+    let right = left + count as i32 * dpi_px(cell, dpi) + pad * 2;
+    let limit = taskbar.right.min(monitor.right).min(tray_left) - pad;
+    if count == 0 {
+        return Ok(None);
+    }
+    if right > limit {
+        return Err("workspace strip does not fit before the tray; reduce taskbar_offset or workspace_width");
+    }
+    let h = dpi_px(TASKBAR_HEIGHT, dpi).min(bottom - top - pad * 2);
+    let y = top + (bottom - top - h) / 2;
+    Ok(Some(RECT {
+        left,
+        top: y,
+        right,
+        bottom: y + h,
+    }))
+}
+
+unsafe fn taskbars_configure(marker: HWND) {
+    if TASKBAR_WORKSPACES.load(Ordering::Relaxed) {
+        // Explorer's auto-hide does not reliably broadcast a work-area change.
+        // Poll geometry only, never a foreign window's message queue.
+        if SetTimer(marker, TASKBAR_TIMER_ID, 250, None) == 0 {
+            log_error!("taskbar workspaces: could not start the taskbar tracking timer");
+        }
+    } else {
+        let _ = KillTimer(marker, TASKBAR_TIMER_ID);
+    }
+    taskbars_sync();
+}
+
+/// Main thread only. No TASKBARS guard crosses CreateWindowEx/SetWindowPos:
+/// those can dispatch our paint/DPI handlers synchronously.
+unsafe fn taskbars_sync() {
+    let mut wins = std::mem::take(&mut *TASKBARS.lock().unwrap());
+    let enabled = TASKBAR_WORKSPACES.load(Ordering::Relaxed);
+    let mut monitors: Vec<(isize, RECT)> = Vec::new();
+    let mut shells = Vec::new();
+    if enabled {
+        if !EnumDisplayMonitors(
+            None,
+            None,
+            Some(bar_mon_enum),
+            LPARAM(&mut monitors as *mut Vec<(isize, RECT)> as isize),
+        )
+        .as_bool()
+        {
+            log_error!("taskbar workspaces: could not enumerate monitors");
+        }
+        monitors.sort_by_key(|m| m.1.left);
+        for class in [w!("Shell_TrayWnd"), w!("Shell_SecondaryTrayWnd")] {
+            let mut after = HWND::default();
+            while let Ok(shell) = FindWindowExW(None, after, class, PCWSTR::null()) {
+                shells.push(shell);
+                after = shell;
+            }
+        }
+    }
+    let primary = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTONEAREST).0 as isize;
+    let mask = BAR_MON_MASK.load(Ordering::Relaxed);
+    let counts: Vec<(isize, usize)> = BAR
+        .lock()
+        .unwrap()
+        .mons
+        .iter()
+        .map(|m| (m.hmon, m.slots.len()))
+        .collect();
+    let fg = GetForegroundWindow();
+    let mut fg_rect = RECT::default();
+    let fg_app = enabled && is_app_surface(fg) && GetWindowRect(fg, &mut fg_rect).is_ok();
+    let fg_mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONULL).0 as isize;
+    let mut shown = Vec::new();
+    for (index, &(hmon, monitor)) in monitors.iter().enumerate() {
+        if !config::bar_on(mask, index, hmon == primary)
+            || (fg_app && fg_mon == hmon && rect_covers_monitor(fg_rect, monitor))
+        {
+            continue;
+        }
+        let Some(&shell) = shells
+            .iter()
+            .find(|&&h| MonitorFromWindow(h, MONITOR_DEFAULTTONULL).0 as isize == hmon)
+        else {
+            continue; // Explorer absent or rebuilding: keep the overlay hidden.
+        };
+        let mut taskbar = RECT::default();
+        if !IsWindowVisible(shell).as_bool() || GetWindowRect(shell, &mut taskbar).is_err() {
+            continue;
+        }
+        let mut tray_left = taskbar.right;
+        if let Ok(tray) = FindWindowExW(shell, None, w!("TrayNotifyWnd"), PCWSTR::null()) {
+            let mut r = RECT::default();
+            if IsWindowVisible(tray).as_bool() && GetWindowRect(tray, &mut r).is_ok() {
+                tray_left = r.left;
+            }
+        }
+        let count = counts.iter().find(|m| m.0 == hmon).map_or(0, |m| m.1);
+        let dpi = monitor_dpi(hmon);
+        let target = taskbar_strip_rect(
+            monitor,
+            taskbar,
+            tray_left,
+            TASKBAR_OFFSET.load(Ordering::Relaxed),
+            count,
+            BAR_CELL.load(Ordering::Relaxed) as i32,
+            dpi,
+        );
+        let i = match wins.iter().position(|t| t.bar.hmon == hmon) {
+            Some(i) => i,
+            None => {
+                wins.push(TaskbarWin {
+                    bar: BarWin { hwnd: 0, hmon },
+                    rect: None,
+                    error: None,
+                });
+                wins.len() - 1
+            }
+        };
+        let t = &mut wins[i];
+        let rect = match target {
+            Ok(r) => {
+                let Some(r) = r else {
+                    t.error = None;
+                    continue;
+                };
+                r
+            }
+            Err(reason) => {
+                if t.error != Some(reason) {
+                    log_error!("taskbar workspaces on monitor {}: {reason}", index + 1);
+                    t.error = Some(reason);
+                }
+                continue;
+            }
+        };
+        if t.bar.hwnd == 0 {
+            match CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                w!("astur_taskbar"),
+                w!("Astur workspaces"),
+                WS_POPUP,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                None,
+                None,
+                HINSTANCE(BAR_HINST.load(Ordering::Relaxed) as *mut c_void),
+                None,
+            ) {
+                Ok(h) => {
+                    t.bar.hwnd = h.0 as isize;
+                    SetWindowLongPtrW(h, GWLP_USERDATA, hmon);
+                }
+                Err(e) => {
+                    if t.error != Some("create") {
+                        log_error!("taskbar workspaces: could not create the overlay: {e}");
+                    }
+                    t.error = Some("create");
+                    continue;
+                }
+            }
+        }
+        let h = hwnd_from(t.bar.hwnd);
+        // Reassert only this small overlay's Z-order, not Explorer's. The shell
+        // raises its taskbar on reveal; unchanged placement needs no repaint.
+        if let Err(e) = SetWindowPos(
+            h,
+            HWND_TOPMOST,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        ) {
+            if t.error != Some("place") {
+                log_error!("taskbar workspaces: could not place the overlay: {e}");
+            }
+            t.error = Some("place");
+            continue;
+        }
+        if t.rect != Some(rect) {
+            let _ = InvalidateRect(h, None, BOOL(0));
+        }
+        t.rect = Some(rect);
+        t.error = None;
+        barhit_publish(t.bar.hwnd, Some(rect));
+        shown.push(t.bar.hwnd);
+    }
+    for t in &mut wins {
+        if t.bar.hwnd != 0 && !shown.contains(&t.bar.hwnd) {
+            let _ = ShowWindow(hwnd_from(t.bar.hwnd), SW_HIDE);
+            barhit_publish(t.bar.hwnd, None);
+            t.rect = None;
+        }
+    }
+    *TASKBARS.lock().unwrap() = wins;
+    BARS_HOT.store(
+        BARHIT_HWND.iter().any(|h| h.load(Ordering::Relaxed) != 0),
+        Ordering::Relaxed,
+    );
+}
+
+unsafe extern "system" fn taskbar_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            paint_bar(h, true);
+            LRESULT(0)
+        }
+        WM_BAR_REFRESH => {
+            taskbars_sync();
+            bar_wndproc(h, msg, w, l)
+        }
+        _ => bar_wndproc(h, msg, w, l),
+    }
 }
 
 /// The date widget's text at `st` (config::format_date: one formatter for
@@ -14924,7 +15239,7 @@ unsafe fn update_bar(mgr: &Manager) {
     // consumes a BarRefresh, the next rename must be able to queue one, or the
     // title freezes with nothing logged (BAR-10).
     bar_refresh_clear(&BAR_REFRESH_QUEUED);
-    if BARS.lock().unwrap().is_empty() {
+    if BARS.lock().unwrap().is_empty() && !mgr.cfg.taskbar_workspaces {
         // No bar was ever built (BARS only grows), so BAR is still the
         // startup seed and holds no icon: mark every retired one free to go.
         // Without this a retired tab-bar icon (tab_bars_build shares this
@@ -14980,34 +15295,36 @@ unsafe fn update_bar(mgr: &Manager) {
             .collect();
         // Each mark's app icons, one per app (an exe's windows share one
         // cached handle), resolved at this monitor's size.
-        let ws_icons: Vec<Vec<isize>> =
-            if mgr.cfg.bar_workspace_apps && mgr.cfg.bar_workspace_style != "dot" {
-                let px = dpi_px(WS_ICON_PX, monitor_dpi(m.hmon));
-                slots
-                    .iter()
-                    .map(|&local| {
-                        let mut icons: Vec<isize> = Vec::with_capacity(3);
-                        let wins = m
-                            .workspaces
-                            .get(local)
-                            .map_or(&[][..], |ws| &ws.windows[..]);
-                        for &h in wins {
-                            if icons.len() == 3 {
-                                break;
-                            }
-                            if IsWindow(hwnd_from(h)).as_bool() {
-                                let icon = bar_app_icon(hwnd_from(h), px);
-                                if !icons.contains(&icon) {
-                                    icons.push(icon);
-                                }
+        let ws_icons: Vec<Vec<isize>> = if mgr.cfg.bar_enabled
+            && mgr.cfg.bar_workspace_apps
+            && mgr.cfg.bar_workspace_style != "dot"
+        {
+            let px = dpi_px(WS_ICON_PX, monitor_dpi(m.hmon));
+            slots
+                .iter()
+                .map(|&local| {
+                    let mut icons: Vec<isize> = Vec::with_capacity(3);
+                    let wins = m
+                        .workspaces
+                        .get(local)
+                        .map_or(&[][..], |ws| &ws.windows[..]);
+                    for &h in wins {
+                        if icons.len() == 3 {
+                            break;
+                        }
+                        if IsWindow(hwnd_from(h)).as_bool() {
+                            let icon = bar_app_icon(hwnd_from(h), px);
+                            if !icons.contains(&icon) {
+                                icons.push(icon);
                             }
                         }
-                        icons
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+                    }
+                    icons
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut occupied: u64 = 0;
         for (pill, &local) in slots.iter().enumerate().take(64) {
             if m.workspaces
@@ -15035,7 +15352,7 @@ unsafe fn update_bar(mgr: &Manager) {
         // sighting). Resolved at THIS monitor's physical icon size — the
         // manager thread cannot read the paint-time DPI.
         let icon_px = dpi_px(BAR_ICON_PX_CFG.load(Ordering::Relaxed), monitor_dpi(m.hmon));
-        let apps: Vec<BarApp> = if mgr.cfg.bar_show_apps {
+        let apps: Vec<BarApp> = if mgr.cfg.bar_enabled && mgr.cfg.bar_show_apps {
             m.workspaces
                 .get(m.active)
                 .map(|ws| {
@@ -15164,7 +15481,15 @@ unsafe fn update_bar(mgr: &Manager) {
     if changed.is_empty() && anim_seeds.is_empty() {
         return;
     }
-    let bars = BARS.lock().unwrap().clone();
+    let mut bars = BARS.lock().unwrap().clone();
+    bars.extend(
+        TASKBARS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.bar.hwnd != 0)
+            .map(|t| t.bar),
+    );
     for b in bars {
         if changed.contains(&b.hmon) {
             let _ = PostMessageW(hwnd_from(b.hwnd), WM_BAR_REFRESH, WPARAM(0), LPARAM(0));
@@ -15195,6 +15520,7 @@ fn bar_data_from(cfg: &Config, light: bool, tiling: bool, mons: Vec<MonBar>) -> 
             .iter()
             .any(|z| z.contains(&BarWidget::MediaControls));
     BarData {
+        taskbar: false,
         bg: r.bg,
         fg: r.fg,
         accent: r.accent,
@@ -16819,7 +17145,7 @@ impl BarCanvas {
 /// the same layout. The owning monitor's HMONITOR is in GWLP_USERDATA so each
 /// bar paints its own data; the hit ranges land in BAR_LAYOUTS for the mouse
 /// handlers.
-unsafe fn paint_bar(h: HWND) {
+unsafe fn paint_bar(h: HWND, taskbar: bool) {
     // What a paint costs on this thread, the hook thread (debug log only):
     // the baseline any bar change is measured against.
     let t0 = probe_now();
@@ -16836,6 +17162,7 @@ unsafe fn paint_bar(h: HWND) {
     let win_hdc = BeginPaint(h, &mut ps);
     let hmon = GetWindowLongPtrW(h, GWLP_USERDATA);
     let data = BAR.lock().unwrap().clone();
+    let data = if taskbar { taskbar_data(data) } else { data };
 
     let mut rc = RECT::default();
     let _ = GetClientRect(h, &mut rc);
@@ -16907,7 +17234,12 @@ unsafe fn render_bar(
     let (hdc, w, h_px) = (cv.hdc, cv.w, cv.h);
     cv.clear(data.bg);
 
-    let text_font = match bar_font_for(dpi) {
+    let font = if data.taskbar {
+        tab_font_for(dpi, TASKBAR_HEIGHT)
+    } else {
+        bar_font_for(dpi)
+    };
+    let text_font = match font {
         0 => GetStockObject(DEFAULT_GUI_FONT),
         f => HGDIOBJ(f as *mut c_void),
     };
@@ -16931,7 +17263,14 @@ unsafe fn render_bar(
     SetBkMode(hdc, TRANSPARENT);
 
     let cell = dpi_px(BAR_CELL.load(Ordering::Relaxed) as i32, dpi);
-    let pad = dpi_px(BAR_PADDING.load(Ordering::Relaxed) as i32, dpi);
+    let pad = dpi_px(
+        if data.taskbar {
+            TASKBAR_PAD
+        } else {
+            BAR_PADDING.load(Ordering::Relaxed) as i32
+        },
+        dpi,
+    );
     // Joined powerline segments sit an arrow's length apart.
     let gap = match powerline_pills(&data.style) {
         true => powerline_cap(h_px),
@@ -17095,7 +17434,7 @@ fn bar_release_pairs(h: isize, button: u8) -> bool {
 unsafe extern "system" fn bar_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => {
-            paint_bar(h);
+            paint_bar(h, false);
             LRESULT(0)
         }
         WM_PILL_ANIM => {
@@ -17998,6 +18337,8 @@ fn bar_shows(cfg: &Config, w: &str) -> bool {
 /// Push the config values the bar paint path and stats worker read from atomics
 /// (so they need no Config in hand). Call at startup and on every reload.
 fn apply_bar_statics(cfg: &Config) {
+    TASKBAR_WORKSPACES.store(cfg.taskbar_workspaces, Ordering::Relaxed);
+    TASKBAR_OFFSET.store(cfg.taskbar_offset, Ordering::Relaxed);
     BAR_HEIGHT.store(
         if cfg.bar_enabled {
             cfg.bar_height as isize
@@ -24700,22 +25041,21 @@ fn main() {
         // already maximized/fullscreen when Astur starts never get covered.
         seed_fullscreen_windows();
 
-        // Status bar on every monitor (waybar-style). Register the class once,
-        // build the font, then create a bar window per monitor.
+        // Register even when disabled at startup, so hot-reload can enable
+        // either surface without a restart. Fonts are lazy, per monitor DPI.
+        let bar_brush = CreateSolidBrush(COLORREF(themed_bar_colors(&cfg).0));
+        let bwc = bar_class(hinst, bar_brush, false);
+        if RegisterClassW(&bwc) == 0 {
+            log_error!("could not register the status bar window class");
+        }
+        let twc = bar_class(hinst, bar_brush, true);
+        if RegisterClassW(&twc) == 0 {
+            log_error!("could not register the taskbar workspace window class");
+        }
         if cfg.bar_enabled && cfg.bar_height > 0 {
-            // Class brush is a first-frame fallback only (paint is buffered).
-            let bar_brush = CreateSolidBrush(COLORREF(themed_bar_colors(&cfg).0));
-            let bwc = WNDCLASSW {
-                lpfnWndProc: Some(bar_wndproc),
-                hInstance: hinst,
-                hbrBackground: bar_brush,
-                lpszClassName: w!("astur_bar"),
-                ..Default::default()
-            };
-            RegisterClassW(&bwc);
-            // Fonts are built lazily per monitor DPI on first paint.
             ensure_bars();
         }
+        taskbars_configure(marker);
 
         // This thread runs the LL hooks and WinEvents from here on: raise it
         // before they exist (see the thread scheduling notes).
@@ -27538,6 +27878,14 @@ mod tests {
                 0,
             ),
             (
+                "enabled = false\nheight = 0\ntaskbar_workspaces = true\n\
+                 workspace_style = pill\nworkspace_label = name\nhover = true"
+                    .into(),
+                false,
+                false,
+                2,
+            ),
+            (
                 format!(
                     "{}icon_mode = glyph_only\nright = net volume battery disk date clock\n",
                     mac
@@ -27617,7 +27965,19 @@ mod tests {
                     m.title = "Astur".into();
                 }
                 let data = bar_data_from(&cfg, *light, true, vec![m]);
-                row_h = dpi_px(cfg.bar_height, dpi);
+                let data = if cfg.taskbar_workspaces {
+                    taskbar_data(data)
+                } else {
+                    data
+                };
+                row_h = dpi_px(
+                    if cfg.taskbar_workspaces {
+                        TASKBAR_HEIGHT
+                    } else {
+                        cfg.bar_height
+                    },
+                    dpi,
+                );
                 let dib = new_bar_dib(screen, w, row_h).expect("DIB");
                 let cv = BarCanvas {
                     hdc: HDC(dib.dc as *mut c_void),
@@ -29059,6 +29419,203 @@ mod tests {
         assert_eq!(scroll_label(Some(1), 5), "scrolling 2/5");
         assert_eq!(scroll_label(None, 3), "scrolling -/3", "focus floating");
         assert_eq!(scroll_label(None, 0), "scrolling");
+    }
+
+    #[test]
+    fn workspace_controls_replace_a_stale_busy_cursor() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetCursor, LoadCursorW, SendMessageW, SetCursor, UnregisterClassW, HTCLIENT,
+            IDC_APPSTARTING, IDC_ARROW, IDC_WAIT, WM_SETCURSOR,
+        };
+        unsafe {
+            let inst = HINSTANCE(GetModuleHandleW(None).unwrap().0);
+            let arrow = LoadCursorW(None, IDC_ARROW).unwrap();
+            for taskbar in [false, true] {
+                let wc = bar_class(inst, Default::default(), taskbar);
+                assert_ne!(RegisterClassW(&wc), 0);
+                let h = CreateWindowExW(
+                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    wc.lpszClassName,
+                    w!(""),
+                    WS_POPUP,
+                    -32000,
+                    -32000,
+                    100,
+                    28,
+                    None,
+                    None,
+                    inst,
+                    None,
+                )
+                .unwrap();
+                for busy in [IDC_WAIT, IDC_APPSTARTING] {
+                    let old = SetCursor(LoadCursorW(None, busy).unwrap());
+                    SendMessageW(
+                        h,
+                        WM_SETCURSOR,
+                        WPARAM(h.0 as usize),
+                        LPARAM(HTCLIENT as isize | ((WM_MOUSEMOVE as isize) << 16)),
+                    );
+                    let cursor = GetCursor();
+                    SetCursor(old);
+                    assert_eq!(
+                        cursor, arrow,
+                        "taskbar={taskbar}: hovering must clear the busy cursor"
+                    );
+                }
+                DestroyWindow(h).unwrap();
+                UnregisterClassW(wc.lpszClassName, inst).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn taskbar_strip_fits_each_dpi_and_never_partially_covers_the_tray() {
+        let monitor = rect(-1920, -1080, 0, 0);
+        let bottom = rect(-1920, -48, 0, 0);
+        assert_eq!(
+            taskbar_strip_rect(monitor, bottom, -160, 180, 5, 34, 96).unwrap(),
+            Some(rect(-1740, -38, -1562, -10)),
+        );
+        let top = rect(-1920, -1080, 0, -1008);
+        assert_eq!(
+            taskbar_strip_rect(monitor, top, -240, 180, 5, 34, 144).unwrap(),
+            Some(rect(-1650, -1065, -1383, -1023)),
+        );
+        assert!(taskbar_strip_rect(monitor, bottom, -1600, 180, 5, 34, 96).is_err());
+        assert!(taskbar_strip_rect(monitor, bottom, 0, 1900, 5, 34, 96).is_err());
+        assert_eq!(
+            taskbar_strip_rect(monitor, bottom, 0, 180, 0, 34, 96).unwrap(),
+            None,
+        );
+        for hidden in [rect(-1920, -2, 0, 46), rect(-1920, -1126, 0, -1078)] {
+            assert_eq!(
+                taskbar_strip_rect(monitor, hidden, 0, 180, 5, 34, 96).unwrap(),
+                None,
+            );
+        }
+        assert!(
+            taskbar_strip_rect(monitor, rect(-1920, -1080, -1872, 0), 0, 180, 5, 34, 96).is_err()
+        );
+    }
+
+    #[test]
+    fn taskbar_only_keeps_workspace_snapshots_live_without_reserving_space() {
+        let mut mgr = test_manager(2, 4);
+        mgr.cfg.bar_enabled = false;
+        mgr.cfg.taskbar_workspaces = true;
+        mgr.cfg.bar_hide_empty = true;
+        mgr.cfg.per_monitor = true;
+        mgr.cfg.bar_workspace_label = "name".into();
+        mgr.cfg.workspace_names = ["Web", "Code", "Chat", "Other"].map(String::from).to_vec();
+        mgr.monitors[0].active = 2;
+        mgr.monitors[0].workspaces[0].windows.push(0x7fff_fffc);
+        mgr.monitors[1].active = 1;
+        unsafe {
+            reserve_bar(&mut mgr.monitors, &mgr.cfg);
+            update_bar(&mgr);
+        }
+        for m in &mgr.monitors {
+            assert_eq!(m.work_area, m.base_work);
+        }
+        let data = taskbar_data(BAR.lock().unwrap().clone());
+        assert_eq!(data.left, [BarWidget::Workspaces]);
+        assert!(data.center.is_empty() && data.right.is_empty());
+        assert_eq!(data.mons[0].slots, [0, 2]);
+        assert_eq!(data.mons[0].labels, ["Web", "Chat"]);
+        assert_eq!(data.mons[0].active, 1);
+        assert_eq!(data.mons[0].occupied, 1);
+        assert_eq!(data.mons[1].slots, [1]);
+        // A hidden, test-owned Win32 window exercises real fonts, painting
+        // layout and the shared click/wheel handler without running a WM.
+        unsafe {
+            let inst = HINSTANCE(GetModuleHandleW(None).unwrap().0);
+            let class = w!("astur_taskbar_test");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(taskbar_wndproc),
+                hInstance: inst,
+                lpszClassName: class,
+                ..Default::default()
+            };
+            assert_ne!(RegisterClassW(&wc), 0);
+            let h = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                class,
+                w!(""),
+                WS_POPUP,
+                -32000,
+                -32000,
+                76,
+                28,
+                None,
+                None,
+                inst,
+                None,
+            )
+            .unwrap();
+            let hmon = mgr.monitors[0].hmon;
+            SetWindowLongPtrW(h, GWLP_USERDATA, hmon);
+            let screen = GetDC(None);
+            for dpi in [96, 144, 192] {
+                BAR_PAINT_DPI.store(dpi, Ordering::Relaxed);
+                let w = 2 * dpi_px(34, dpi) + 2 * dpi_px(TASKBAR_PAD, dpi);
+                let dib = new_bar_dib(screen, w, dpi_px(TASKBAR_HEIGHT, dpi)).unwrap();
+                let cv = BarCanvas {
+                    hdc: HDC(dib.dc as *mut c_void),
+                    bits: dib.bits as *mut u32,
+                    w,
+                    h: dib.h,
+                };
+                let lay = render_bar(&cv, &data, hmon, dpi, 0, None);
+                assert_eq!(
+                    lay.pills,
+                    mark_spans(dpi_px(TASKBAR_PAD, dpi), &[dpi_px(34, dpi); 2])
+                );
+                assert!(lay.apps.is_empty());
+                let x = lay.pills[1].0 + 1;
+                BAR_LAYOUTS
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(HashMap::new)
+                    .insert(h.0 as isize, lay);
+                taskbar_wndproc(h, WM_LBUTTONDOWN, WPARAM(0), LPARAM(x as isize));
+                assert!(
+                    matches!(CMDQ.lock().unwrap().pop_back(), Some(Cmd::BarClick(m, 2)) if m == hmon)
+                );
+                let _ = GdiFlush();
+                SelectObject(cv.hdc, HGDIOBJ(dib.old as *mut c_void));
+                let _ = DeleteObject(HGDIOBJ(dib.bmp as *mut c_void));
+                let _ = DeleteDC(cv.hdc);
+            }
+            taskbar_wndproc(h, WM_BAR_WHEEL, WPARAM(120), LPARAM(0));
+            assert!(
+                matches!(CMDQ.lock().unwrap().pop_back(), Some(Cmd::BarCycle(m, -1)) if m == hmon)
+            );
+            assert!(!IsWindowVisible(h).as_bool());
+            BAR_LAYOUTS
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .remove(&(h.0 as isize));
+            let _ = ReleaseDC(None, screen);
+            DestroyWindow(h).unwrap();
+            windows::Win32::UI::WindowsAndMessaging::UnregisterClassW(class, inst).unwrap();
+            bar_fonts_clear();
+            BAR_PAINT_DPI.store(96, Ordering::Relaxed);
+            BAR_PRESS.set(None);
+        }
+        // A switch changes both the count and the local-index mapping.
+        mgr.monitors[0].active = 3;
+        unsafe { update_bar(&mgr) };
+        assert_eq!(BAR.lock().unwrap().mons[0].slots, [0, 3]);
+        mgr.cfg.per_monitor = false;
+        mgr.cfg.bar_hide_empty = false;
+        mgr.cfg.bar_workspace_label = "number".into();
+        unsafe { update_bar(&mgr) };
+        let data = BAR.lock().unwrap();
+        assert_eq!(data.mons[0].labels, ["1", "3", "5", "7"]);
+        assert_eq!(data.mons[1].labels, ["2", "4", "6", "8"]);
     }
 
     #[test]

@@ -2037,6 +2037,7 @@ impl App {
                 c.yasb_enabled = which == "yasb";
             }
         }
+        taskbar_rows(ui, f, c, &self.def);
         let mut go_yasb = false;
         if !f.on() {
             if c.bar_enabled {
@@ -2054,9 +2055,9 @@ impl App {
         if go_yasb {
             self.page = Page::Integrations;
         }
-        // The rest is Astur's own bar: greyed while another is chosen. Not
-        // while searching (a hit's page heading must stay clickable).
-        if self.cfg.bar_enabled || self.find.on() {
+        // Workspace appearance is shared with the taskbar strip. Keep the
+        // controls available for it and while searching.
+        if self.cfg.bar_enabled || self.cfg.taskbar_workspaces || self.find.on() {
             self.bar_body(ui);
         } else {
             ui.add_enabled_ui(false, |ui| self.bar_body(ui));
@@ -3690,6 +3691,36 @@ fn bar_style_row(
         apply = BAR_PRESETS.first();
     }
     apply
+}
+
+fn taskbar_rows(ui: &mut Ui, f: &mut Find, c: &mut Config, d: &Config) {
+    toggle(
+        ui,
+        f,
+        (
+            "Taskbar workspaces",
+            "Horizontal taskbars only. Choose No bar to replace the top bar.",
+            "taskbar_workspaces",
+        ),
+        &mut c.taskbar_workspaces,
+        d.taskbar_workspaces,
+    );
+    when(ui, f, c.taskbar_workspaces, |ui, f| {
+        row(
+            ui,
+            f,
+            (
+                "Taskbar offset",
+                "For low offsets, set Windows taskbar alignment to Center.",
+                "taskbar_offset",
+            ),
+            &mut c.taskbar_offset,
+            &d.taskbar_offset,
+            |ui, value| {
+                ui.add(egui::DragValue::new(value).range(0..=10000).suffix(" px"));
+            },
+        );
+    });
 }
 
 /// Home's window gaps: one size for the edges and between windows.
@@ -6189,6 +6220,8 @@ fn conf_pairs(c: &Config) -> (Pairs, Pairs) {
     ];
     let mut nav_updates: Vec<(&str, String)> = vec![
         ("enabled", b(c.bar_enabled)),
+        ("taskbar_workspaces", b(c.taskbar_workspaces)),
+        ("taskbar_offset", c.taskbar_offset.to_string()),
         ("height", c.bar_height.to_string()),
         ("bottom", b(c.bar_bottom)),
         ("padding", c.bar_padding.to_string()),
@@ -9503,6 +9536,29 @@ mod tests {
     }
 
     #[test]
+    fn taskbar_controls_save_and_undo_without_enabling_the_top_bar() {
+        let paths = temp_paths("taskbar", "", "# keep this\nenabled = false\n");
+        let mut app = App::load(paths.clone());
+        app.cfg.taskbar_workspaces = true;
+        app.cfg.taskbar_offset = 320;
+        app.commit();
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let text = std::fs::read_to_string(&paths[1]).unwrap();
+        let c = parse_pair("", &text);
+        assert!(text.contains("# keep this"));
+        assert!(c.taskbar_workspaces);
+        assert_eq!(c.taskbar_offset, 320);
+        assert!(!c.bar_enabled);
+        app.undo();
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let c = parse_pair("", &std::fs::read_to_string(&paths[1]).unwrap());
+        assert!(!c.taskbar_workspaces);
+        assert_eq!(c.taskbar_offset, 0);
+        assert!(!c.bar_enabled);
+        std::fs::remove_dir_all(paths[0].parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn save_writes_only_what_changed() {
         // Every save used to write ~155 keys: a hand-written file gained ~150
         // lines and edits made while Settings was open were reverted.
@@ -10505,6 +10561,7 @@ key_close_window = F4
             "title_",
             "monitors",
             "_click",
+            "taskbar_",
         ] {
             shots.push((format!("Bar-{key}"), Page::Bar, key, "dark"));
         }
@@ -11277,6 +11334,9 @@ key_close_window = F4
                         fits(ui, "workspaces, screens");
                         click_rows(ui, &mut f, &mut c, &d);
                         fits(ui, "click actions");
+                        c.taskbar_workspaces = true;
+                        taskbar_rows(ui, &mut f, &mut c, &d);
+                        fits(ui, "taskbar controls");
                     });
                 });
             });

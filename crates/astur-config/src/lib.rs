@@ -160,6 +160,8 @@ pub struct Config {
     pub main_key: MainKey,
     pub window_rules: Vec<WindowRule>,
     pub bar_enabled: bool,         // draw the status bar on every monitor
+    pub taskbar_workspaces: bool,  // workspace-only overlay on the Windows taskbar
+    pub taskbar_offset: i32,       // logical px from the taskbar's left edge
     pub bar_height: i32,           // bar thickness in px (work area is reserved for it)
     pub bar_bottom: bool,          // dock the bar at the bottom instead of the top
     pub bar_font_size: i32,        // text height in px; 0 = auto from bar_height
@@ -1250,6 +1252,8 @@ impl Config {
             }],
             window_rules: Vec::new(),
             bar_enabled: true,
+            taskbar_workspaces: false,
+            taskbar_offset: 0,
             bar_height: 28,
             bar_bottom: false,
             bar_font_size: 0,
@@ -1916,8 +1920,17 @@ const DEFAULT_NAVBAR: &str = "\
 # 42 px at 150%, correctly on each screen of a mixed-scale setup.
 # ============================================================================
 
-# Show the bars.  bool   (set false to disable entirely)
+# Show the full status bars. bool (taskbar_workspaces is independent)
 enabled = true
+# Workspace-only overlay on the Windows taskbar, independent of enabled.
+# Set enabled = false to replace the top bar. Horizontal taskbars only.
+# No space is reserved in Explorer: adjust offset to an unused area.
+# Reuses monitors, workspace labels/style/width, hide-empty and wheel settings.
+# Long labels are clipped to workspace_width; app icons are not shown.
+taskbar_workspaces = false
+# Distance from each taskbar's left edge, in logical px. int 0 - 10000
+# For low offsets, set Windows taskbar alignment to Center.
+taskbar_offset = 0
 # Bar thickness in pixels.  int 0 - 200  (0 also disables it)
 height = 28
 # Dock the bars at the bottom of each screen instead of the top.  bool
@@ -3090,6 +3103,12 @@ fn parse_into_from(c: &mut Config, text: &str, source: &str) {
             }
             // ---- navbar (navbar.conf, unprefixed) and legacy bar_* aliases ----
             "enabled" | "bar_enabled" => c.bar_enabled = parse_bool(v),
+            "taskbar_workspaces" => c.taskbar_workspaces = parse_bool(v),
+            "taskbar_offset" => {
+                if let Ok(n) = v.parse::<i32>() {
+                    c.taskbar_offset = n.clamp(0, 10000);
+                }
+            }
             "height" | "bar_height" => {
                 if let Ok(n) = v.parse::<i32>() {
                     c.bar_height = n.clamp(0, 200);
@@ -3522,6 +3541,8 @@ pub fn reload_groups(old: &Config, new: &Config) -> ReloadGroups {
         extra_hotkeys,
         window_rules,
         bar_enabled,
+        taskbar_workspaces,
+        taskbar_offset,
         bar_height,
         bar_bottom,
         bar_font_size,
@@ -3638,6 +3659,7 @@ pub fn reload_groups(old: &Config, new: &Config) -> ReloadGroups {
     // would reach it through the manager's next bar update anyway; statics
     // read at paint (padding, cell width, gap, radius, fonts) need the rebuild.
     diff!(bar: bar_enabled, bar_height, bar_bottom, bar_font_size, bar_font_name, bar_padding);
+    diff!(bar: taskbar_workspaces, taskbar_offset);
     diff!(bar: bar_floating, bar_margin, bar_radius, bar_autohide, bar_wheel_ws);
     diff!(bar: bar_show_title, bar_show_clock, bar_clock_24h, bar_show_layout, bar_show_date);
     diff!(bar: bar_show_cpu, bar_show_mem, bar_show_battery, bar_show_net, bar_show_volume);
@@ -5181,6 +5203,30 @@ outer_gap = 4
                 assert_ne!(g, ReloadGroups::full(), "`{key}` fell through to full");
             }
         }
+    }
+
+    #[test]
+    fn taskbar_workspaces_are_opt_in_and_reload_without_retiling() {
+        let base = default_config();
+        assert!(!base.taskbar_workspaces);
+        let c = parse_pair(
+            "",
+            "enabled = false\ntaskbar_workspaces = true\ntaskbar_offset = 240",
+        );
+        assert!(!c.bar_enabled);
+        assert!(c.taskbar_workspaces);
+        assert_eq!(c.taskbar_offset, 240);
+        assert!(c.unknown_keys.is_empty());
+        let off = parse_pair("", "enabled = false");
+        assert_eq!(
+            reload_groups(&off, &c),
+            ReloadGroups {
+                bar: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(parse_text("taskbar_offset = -1").taskbar_offset, 0);
+        assert_eq!(parse_text("taskbar_offset = 99999").taskbar_offset, 10000);
     }
 
     #[test]
