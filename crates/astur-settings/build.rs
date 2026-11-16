@@ -1,5 +1,7 @@
-// Embed the Windows resource script (the app icon) into astur-settings.exe.
-// Reuses the WM's assets/astur.ico so both exes carry the hawk.
+// Embed the icon, manifest and version info into astur-settings.exe. Shares
+// the WM's script and assets so both exes carry the same hawk and metadata.
+include!("../astur/resources.rs");
+
 fn main() {
-    embed_resource::compile("astur-settings.rc", embed_resource::NONE);
+    embed_resources("astur-settings", "Astur settings");
 }

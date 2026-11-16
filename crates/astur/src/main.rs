@@ -81,7 +81,8 @@ use windows::Win32::System::Console::{
 };
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+    RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
@@ -5576,14 +5577,30 @@ fn launch(cmd: &str) {
     }
 }
 
-/// `launch`'s body. CREATE_NO_WINDOW: Astur has no console in release, so
+/// `launch`'s body. Plain `program args` / paths / URIs go straight to
+/// `ShellExecuteExW`, which resolves PATH, App Paths and App Execution Aliases
+/// (wt.exe) like `start` does, without a hidden cmd.exe child: a GUI process
+/// spawning hidden shells is a stock EDR/PUA heuristic. Shell syntax
+/// (`shell_target` returns None) and any ShellExecute failure still go through
+/// `cmd /C start`, so nothing that launched before stops launching.
+fn launch_now(cmd: &str) {
+    let is_path = std::path::Path::new(&expand_env(cmd, |n| std::env::var(n).ok())).exists();
+    if let Some((file, params)) = shell_target(cmd, is_path) {
+        if shell_execute(&file, &params) {
+            return;
+        }
+        log_debug!("ShellExecuteEx failed ({cmd}); retrying through cmd");
+    }
+    launch_via_cmd(cmd, is_path);
+}
+
+/// The old launch path. CREATE_NO_WINDOW: Astur has no console in release, so
 /// cmd.exe used to open a console window of its own for the moment `start`
 /// ran, which could flash and be adopted then retiled away. `start` still
 /// gives a console target (cmd, pwsh) its own new console window.
-fn launch_now(cmd: &str) {
+fn launch_via_cmd(cmd: &str, is_path: bool) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let is_path = std::path::Path::new(&expand_env(cmd, |n| std::env::var(n).ok())).exists();
     if let Err(e) = std::process::Command::new("cmd")
         .arg("/C")
         .raw_arg(start_line(cmd, is_path))
@@ -5594,7 +5611,70 @@ fn launch_now(cmd: &str) {
     }
 }
 
-/// What `launch_now` hands cmd.exe after `/C`, verbatim (`raw_arg`), so a
+/// `ShellExecuteExW(open, file, params)` on the calling (short-lived launch)
+/// thread. NO_UI so a failure falls back to cmd, whose `start` shows the
+/// usual "cannot find" dialog once instead of twice. Env vars are already
+/// expanded by `shell_target`.
+fn shell_execute(file: &str, params: &str) -> bool {
+    use windows::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+    };
+    let wide = |s: &str| {
+        s.encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let (f, p, verb) = (wide(file), wide(params), wide("open"));
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(f.as_ptr()),
+        lpParameters: if params.is_empty() {
+            PCWSTR::null()
+        } else {
+            PCWSTR(p.as_ptr())
+        },
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    // SAFETY: every pointer in `info` borrows a buffer that outlives the call;
+    // COM is initialised for this thread first, as ShellExecuteEx requires.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        ShellExecuteExW(&mut info).is_ok()
+    }
+}
+
+/// Split a launch command into ShellExecute's file + parameters, the way
+/// `start` reads it: a whole existing path (`is_path`), a leading quoted
+/// program, or the first word. `%VAR%`s are expanded as cmd would. None for
+/// text that needs cmd itself (`& | < > ^`, or an unmatched quote), which
+/// keeps its shell meaning by going through `launch_via_cmd`.
+fn shell_target(cmd: &str, is_path: bool) -> Option<(String, String)> {
+    if cmd.contains(['&', '|', '<', '>', '^']) {
+        return None;
+    }
+    let text = expand_env(cmd.trim(), |n| std::env::var(n).ok());
+    if is_path {
+        return Some((text.trim_matches('"').to_string(), String::new()));
+    }
+    let (file, rest) = if let Some(quoted) = text.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        (&quoted[..end], &quoted[end + 1..])
+    } else {
+        match text.find(char::is_whitespace) {
+            Some(i) => (&text[..i], &text[i..]),
+            None => (&text[..], ""),
+        }
+    };
+    if file.is_empty() {
+        return None;
+    }
+    Some((file.to_string(), rest.trim().to_string()))
+}
+
+/// What `launch_via_cmd` hands cmd.exe after `/C`, verbatim (`raw_arg`), so a
 /// command takes arguments as it does typed into cmd: `wt -p Ubuntu`,
 /// `explorer.exe "C:\Tools\rio.exe"`. std's own quoting wrapped any command
 /// with a space in quotes and escaped inner quotes as `\"`, which cmd does not
@@ -19035,6 +19115,7 @@ const LA_SCROLL: usize = 9; // mouse wheel: lParam = +1 (up) / -1 (down)
 const LA_KEY: usize = 10; // raw key: lParam = vk | scan<<16 | shift<<32 | caps<<33
 const LA_REFRESH: usize = 11; // F5: rebuild installed/custom app list
 const LA_OPEN_SWITCHER: usize = 12; // Alt+Tab replacement: window-only mode
+const LA_CLIP_SYNC: usize = 13; // config applied: match the clipboard listener to clipboard_history
 
 // Theme (COLORREF is 0x00BBGGRR). Forte blue #366382 accent on a dark surface;
 // minimal chrome (thin frame, subtle divider) for a clean omarchy/rofi look.
@@ -19278,6 +19359,14 @@ fn apply_theme(cfg: &Config) {
     if font_changed {
         POPUP_FONT_DIRTY.store(true, Ordering::Release);
     }
+    // After UI_CFG is stored: a launcher thread that reads it before this point
+    // has already published its hwnd, so one side always sees the new value.
+    let hl = LAUNCHER_HWND.load(Ordering::Relaxed);
+    if hl != 0 {
+        // SAFETY: posting to a window handle is safe even if it is gone.
+        let _ =
+            unsafe { PostMessageW(hwnd_from(hl), WM_LAUNCHER, WPARAM(LA_CLIP_SYNC), LPARAM(0)) };
+    }
     // Let a sleeping IPC worker notice ipc_enabled without waiting out its
     // backstop timeout.
     IPC_WAKE.1.notify_all();
@@ -19485,6 +19574,36 @@ unsafe fn clipboard_is_sensitive(h: HWND) -> bool {
         }
     }
     false
+}
+
+/// Whether the launcher window is registered as a clipboard listener. Launcher
+/// thread only.
+static CLIP_LISTENING: AtomicBool = AtomicBool::new(false);
+
+/// Listen to the clipboard only while `clipboard_history` is on. An always-on
+/// listener in a binary with global keyboard hooks reads as spyware to AV/EDR
+/// heuristics, and with history off every update was dropped anyway.
+/// Launcher thread only (the listener belongs to its window).
+unsafe fn clipboard_listener_sync(h: HWND) {
+    let want = UI_CFG
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|c| c.clipboard_history);
+    if want == CLIP_LISTENING.load(Ordering::Relaxed) {
+        return;
+    }
+    let ok = if want {
+        AddClipboardFormatListener(h).is_ok()
+    } else {
+        RemoveClipboardFormatListener(h).is_ok()
+    };
+    if ok {
+        CLIP_LISTENING.store(want, Ordering::Relaxed);
+    }
+    if !want {
+        CLIPBOARD_ITEMS.lock().unwrap().clear();
+    }
 }
 
 unsafe fn clipboard_capture(h: HWND) {
@@ -22217,6 +22336,7 @@ unsafe extern "system" fn launcher_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPAR
     match msg {
         WM_LAUNCHER => {
             match w.0 {
+                LA_CLIP_SYNC => clipboard_listener_sync(h),
                 LA_OPEN => {
                     // Remember what had focus. The picker is NOACTIVATE, but
                     // hiding it does not synchronously hand foreground back, so
@@ -22652,7 +22772,7 @@ fn launcher_thread() {
         };
         make_launcher_font();
         LAUNCHER_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
-        let _ = AddClipboardFormatListener(hwnd);
+        clipboard_listener_sync(hwnd);
         // Modern rounded corners on the picker card (Win11; no-op pre-22000).
         let pref = DWMWCP_ROUND;
         let _ = DwmSetWindowAttribute(
@@ -28774,6 +28894,28 @@ mod tests {
             m.remove(&snapped);
             m.remove(&fresh);
         }
+    }
+
+    #[test]
+    fn a_plain_launch_command_skips_cmd_and_shell_syntax_keeps_it() {
+        let t = |c: &str, p: bool| shell_target(c, p).map(|(f, a)| (f, a));
+        let pair = |f: &str, a: &str| Some((f.to_string(), a.to_string()));
+        assert_eq!(t("wt -p Ubuntu", false), pair("wt", "-p Ubuntu"));
+        assert_eq!(t("wt", false), pair("wt", ""));
+        assert_eq!(t("http://", false), pair("http://", ""));
+        assert_eq!(
+            t(r#""C:\Program Files\Rio\rio.exe" --flag "x y""#, false),
+            pair(r"C:\Program Files\Rio\rio.exe", r#"--flag "x y""#)
+        );
+        assert_eq!(
+            t(r"C:\Program Files\Rio\rio.exe", true),
+            pair(r"C:\Program Files\Rio\rio.exe", "")
+        );
+        // Shell syntax and a broken quote stay with cmd.
+        assert_eq!(t("a.exe & b.exe", false), None);
+        assert_eq!(t("dir > out.txt", false), None);
+        assert_eq!(t(r#""C:\no end"#, false), None);
+        assert_eq!(t(r#""" x"#, false), None);
     }
 
     #[test]

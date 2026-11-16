@@ -215,6 +215,7 @@ name = "astur"
 version = "2.4.0"
 dependencies = [
  "astur-config",
+ "embed-manifest",
  "embed-resource",
  "serde_json",
  "tungstenite",
@@ -231,6 +232,7 @@ version = "2.4.0"
 dependencies = [
  "astur-config",
  "eframe",
+ "embed-manifest",
  "embed-resource",
  "windows",
 ]
@@ -1019,6 +1021,12 @@ checksum = "9e4cadcff7a5353ba72b7fea76bf2122b5ebdbc68e8155aa56dfdea90083fe1b"
 dependencies = [
  "bytemuck",
 ]
+
+[[package]]
+name = "embed-manifest"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba92c8f4591bf29f89716b45e5f5f56577adbb81426e5620c6e994da7c88bb7a"
 
 [[package]]
 name = "embed-resource"

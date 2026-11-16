@@ -350,9 +350,12 @@ these as tables and escapes them for you). Built-in icon names:
 power-circle restart screenshot search settings setup signout sleep terminal wallpaper web window`.
 
 Commands Astur runs (`terminal`, `browser`, `scratchpad_command`, the `launch`
-hotkey action, IPC `launch` and `cmd:` targets) are cmd.exe command lines
-(`cmd /C start "" <command>`): PATH and App Execution Aliases resolve and
-arguments work, e.g. `terminal = wt -p Ubuntu`. Quote a path with spaces (or
+hotkey action, IPC `launch` and `cmd:` targets) read like cmd.exe command lines
+(`start "" <command>`): PATH and App Execution Aliases resolve and
+arguments work, e.g. `terminal = wt -p Ubuntu`. A plain `program arguments`
+command is opened directly by the shell (no cmd.exe); one that uses cmd
+characters (`& | < > ^`), or that the shell can't open, runs through
+`cmd /C start`. Quote a path with spaces (or
 whose `%VARIABLES%` expand to spaces, like a `C:\Users\John Smith` profile) when
 arguments follow it: `"C:\Program Files\App\app.exe" --flag`. A bare path to an
 existing file or folder works unquoted, `%VARIABLES%` included. cmd characters

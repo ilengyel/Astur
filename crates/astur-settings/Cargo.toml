@@ -10,7 +10,9 @@ name = "astur-settings"
 path = "src/main.rs"
 
 [build-dependencies]
-# Embeds the Astur hawk icon into the exe (same icon as the WM).
+# The WM's manifest (../astur/assets/astur.manifest); see crates/astur.
+embed-manifest = "1.5"
+# Embeds the Astur hawk icon (same icon as the WM) and VERSIONINFO.
 embed-resource = "2"
 
 [dependencies]
