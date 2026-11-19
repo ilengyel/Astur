@@ -107,6 +107,16 @@ them.
   `plan/decisions.md`). Font
   weight, widget gaps, app labels/tooltips, stat labels, formats and media text
   are configurable.
+- **Taskbar workspaces**: an optional workspace-only strip over the Windows
+  taskbar, without injecting into or modifying Explorer. In Settings, open
+  **Status bar**, choose **No bar**, then turn on **Taskbar workspaces**.
+  Adjust **Taskbar offset** to an unused area clear of Start and pinned apps.
+  The strip reuses workspace labels, colours, active/occupied marks, clicks,
+  wheel switching and the `monitors` selection. It reserves no extra tiling
+  space, follows horizontal taskbars and their auto-hide, and rediscovers them
+  after Explorer restarts. Windows does not reserve space for the strip:
+  app buttons can overlap it as the taskbar fills up. Vertical taskbars are
+  not supported; a strip that cannot fit before the tray hides and logs why.
 - **Animations** — workspace switches animate with a composited overlay:
   `slide`, `spring` (overshoot-and-settle, Hyprland-style), `fade`, or `off`. Windows
   also **glide** to new slots (re-tile, open/close reflow, scrolling, resizes,
@@ -337,6 +347,13 @@ everything, which also repairs any window left mis-styled:
   `bottom`, `autohide` or the wheel / hide-empty behaviour. The look includes icon mode, workspace style, widget colours,
   separator style, hover and the title's format and weight.
   A `shape` line overrides `floating`.
+  For workspace controls on the Windows taskbar instead of the full status
+  bar, set `enabled = false`, `taskbar_workspaces = true`, and adjust
+  `taskbar_offset = 0` in logical pixels from each taskbar's left edge.
+  For low offsets, set Windows taskbar alignment to **Center**.
+  Taskbar buttons use fixed `workspace_width` cells, clip long labels, and
+  omit app icons. This overlay remains available with `height = 0`; its
+  height is up to 28 logical pixels, limited by the taskbar.
 
 Save both as UTF-8. The window manager never overwrites a file it cannot read (a
 UTF-16 "Unicode" save, or one locked mid-save): it keeps its current settings
