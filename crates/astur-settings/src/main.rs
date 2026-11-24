@@ -3699,7 +3699,7 @@ fn taskbar_rows(ui: &mut Ui, f: &mut Find, c: &mut Config, d: &Config) {
         f,
         (
             "Taskbar workspaces",
-            "Horizontal taskbars only. Choose No bar to replace the top bar.",
+            "All four edges. No bar hides the top bar.",
             "taskbar_workspaces",
         ),
         &mut c.taskbar_workspaces,
@@ -3711,7 +3711,7 @@ fn taskbar_rows(ui: &mut Ui, f: &mut Find, c: &mut Config, d: &Config) {
             f,
             (
                 "Taskbar offset",
-                "For low offsets, set Windows taskbar alignment to Center.",
+                "From left, or top if vertical.\nRecomend 0 px with Windows taskbar alignment set to center.",
                 "taskbar_offset",
             ),
             &mut c.taskbar_offset,

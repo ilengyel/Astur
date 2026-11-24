@@ -113,10 +113,11 @@ them.
   Adjust **Taskbar offset** to an unused area clear of Start and pinned apps.
   The strip reuses workspace labels, colours, active/occupied marks, clicks,
   wheel switching and the `monitors` selection. It reserves no extra tiling
-  space, follows horizontal taskbars and their auto-hide, and rediscovers them
+  space, follows taskbars on all four edges and their auto-hide, and rediscovers them
   after Explorer restarts. Windows does not reserve space for the strip:
-  app buttons can overlap it as the taskbar fills up. Vertical taskbars are
-  not supported; a strip that cannot fit before the tray hides and logs why.
+  app buttons can overlap it as the taskbar fills up. Vertical taskbars stack
+  upright labels in buttons sized to the taskbar's width. A strip that cannot
+  fit or would overlap the tray hides and logs why.
 - **Animations** — workspace switches animate with a composited overlay:
   `slide`, `spring` (overshoot-and-settle, Hyprland-style), `fade`, or `off`. Windows
   also **glide** to new slots (re-tile, open/close reflow, scrolling, resizes,
@@ -349,11 +350,13 @@ everything, which also repairs any window left mis-styled:
   A `shape` line overrides `floating`.
   For workspace controls on the Windows taskbar instead of the full status
   bar, set `enabled = false`, `taskbar_workspaces = true`, and adjust
-  `taskbar_offset = 0` in logical pixels from each taskbar's left edge.
-  For low offsets, set Windows taskbar alignment to **Center**.
-  Taskbar buttons use fixed `workspace_width` cells, clip long labels, and
+  `taskbar_offset = 0` in logical pixels from each taskbar's left edge,
+  or its top edge when vertical.
+  For low horizontal offsets, set Windows taskbar alignment to **Center**.
+  Taskbar buttons use fixed `workspace_width` cells along the taskbar, clip long labels, and
   omit app icons. This overlay remains available with `height = 0`; its
-  height is up to 28 logical pixels, limited by the taskbar.
+  horizontal height is up to 28 logical pixels, limited by the taskbar.
+  Vertical buttons fill the taskbar width minus padding.
 
 Save both as UTF-8. The window manager never overwrites a file it cannot read (a
 UTF-16 "Unicode" save, or one locked mid-save): it keeps its current settings

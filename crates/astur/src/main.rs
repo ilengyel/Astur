@@ -2800,6 +2800,9 @@ static TASKBAR_OFFSET: AtomicI32 = AtomicI32::new(0);
 const TASKBAR_TIMER_ID: usize = 20;
 const TASKBAR_HEIGHT: i32 = 28;
 const TASKBAR_PAD: i32 = 4;
+// One main-thread-owned orientation flag in the taskbar class's extra bytes.
+const TASKBAR_AXIS: windows::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX =
+    windows::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX(0);
 
 struct TaskbarWin {
     bar: BarWin,
@@ -2925,7 +2928,8 @@ fn barhit_publish(hwnd: isize, r: Option<RECT>) {
 /// `bar_hits` from the same layout paint draws.
 #[derive(Default, Clone)]
 struct BarLayout {
-    pills: Vec<(i32, i32)>,       // each workspace mark's x-range
+    vertical: bool,               // workspace ranges use Y on vertical taskbars
+    pills: Vec<(i32, i32)>,       // each workspace mark's axis range
     apps: Vec<(i32, i32, isize)>, // (x0, x1, hwnd)
     vol: (i32, i32),              // volume widget x-range (0,0 = not shown)
     hits: Vec<BarHit>,            // widgets with a click action
@@ -3453,6 +3457,7 @@ fn bar_style(cfg: &Config, r: &config::BarRoles) -> BarStyle {
 #[derive(Clone)]
 struct BarData {
     taskbar: bool,
+    taskbar_vertical: bool,
     bg: u32,
     fg: u32,
     accent: u32,
@@ -3496,6 +3501,7 @@ impl BarData {
     fn new() -> Self {
         BarData {
             taskbar: false,
+            taskbar_vertical: false,
             bg: 0x00261B1A,
             fg: 0x00F5CAC0,
             accent: 0x00FFAA66,
@@ -13613,6 +13619,11 @@ unsafe fn bar_class(
         Default::default()
     });
     WNDCLASSW {
+        cbWndExtra: if taskbar {
+            std::mem::size_of::<isize>() as i32
+        } else {
+            0
+        },
         lpfnWndProc: if taskbar {
             Some(taskbar_wndproc)
         } else {
@@ -14227,8 +14238,9 @@ unsafe fn ensure_bars_inner() {
 
 /// A separate workspace-only view of the manager's snapshot. Fixed-width
 /// labels keep the overlay predictable; app icons stay on the full bar.
-fn taskbar_data(mut data: BarData) -> BarData {
+fn taskbar_data(mut data: BarData, vertical: bool) -> BarData {
     data.taskbar = true;
+    data.taskbar_vertical = vertical;
     data.left = vec![BarWidget::Workspaces];
     data.center.clear();
     data.right.clear();
@@ -14243,24 +14255,44 @@ fn taskbar_data(mut data: BarData) -> BarData {
     data
 }
 
-/// Fit wholly inside a revealed horizontal taskbar, never over the tray.
+fn taskbar_vertical(taskbar: RECT) -> bool {
+    taskbar.bottom - taskbar.top > taskbar.right - taskbar.left
+}
+
+fn transpose_rect(r: RECT) -> RECT {
+    RECT {
+        left: r.top,
+        top: r.left,
+        right: r.bottom,
+        bottom: r.right,
+    }
+}
+
+/// Fit wholly inside a revealed taskbar, never over the tray.
 /// None means auto-hidden/off-screen. Err means a user-adjustable placement
 /// cannot fit; never show a clipped list with unreachable workspace buttons.
 fn taskbar_strip_rect(
     monitor: RECT,
     taskbar: RECT,
-    tray_left: i32,
+    tray: Option<RECT>,
     offset: i32,
     count: usize,
     cell: i32,
     dpi: u32,
 ) -> Result<Option<RECT>, &'static str> {
+    let vertical = taskbar_vertical(taskbar);
+    let (monitor, taskbar, tray) = if vertical {
+        (
+            transpose_rect(monitor),
+            transpose_rect(taskbar),
+            tray.map(transpose_rect),
+        )
+    } else {
+        (monitor, taskbar, tray)
+    };
     let height = taskbar.bottom - taskbar.top;
     if height <= 0 || taskbar.right <= taskbar.left {
         return Ok(None);
-    }
-    if taskbar.right - taskbar.left <= height {
-        return Err("vertical taskbars are not supported");
     }
     let top = taskbar.top.max(monitor.top);
     let bottom = taskbar.bottom.min(monitor.bottom);
@@ -14270,20 +14302,34 @@ fn taskbar_strip_rect(
     let pad = dpi_px(TASKBAR_PAD, dpi);
     let left = taskbar.left.max(monitor.left) + dpi_px(offset, dpi);
     let right = left + count as i32 * dpi_px(cell, dpi) + pad * 2;
-    let limit = taskbar.right.min(monitor.right).min(tray_left) - pad;
+    let limit = taskbar.right.min(monitor.right) - pad;
     if count == 0 {
         return Ok(None);
     }
     if right > limit {
-        return Err("workspace strip does not fit before the tray; reduce taskbar_offset or workspace_width");
+        return Err("workspace strip does not fit inside the taskbar; reduce taskbar_offset or workspace_width");
     }
-    let h = dpi_px(TASKBAR_HEIGHT, dpi).min(bottom - top - pad * 2);
+    let h = if vertical {
+        bottom - top - pad * 2
+    } else {
+        dpi_px(TASKBAR_HEIGHT, dpi).min(bottom - top - pad * 2)
+    };
     let y = top + (bottom - top - h) / 2;
-    Ok(Some(RECT {
+    let strip = RECT {
         left,
         top: y,
         right,
         bottom: y + h,
+    };
+    if tray.is_some_and(|t| {
+        strip.left < t.right && strip.right > t.left && strip.top < t.bottom && strip.bottom > t.top
+    }) {
+        return Err("workspace strip overlaps the tray; adjust taskbar_offset or workspace_width");
+    }
+    Ok(Some(if vertical {
+        transpose_rect(strip)
+    } else {
+        strip
     }))
 }
 
@@ -14357,11 +14403,11 @@ unsafe fn taskbars_sync() {
         if !IsWindowVisible(shell).as_bool() || GetWindowRect(shell, &mut taskbar).is_err() {
             continue;
         }
-        let mut tray_left = taskbar.right;
+        let mut tray_rect = None;
         if let Ok(tray) = FindWindowExW(shell, None, w!("TrayNotifyWnd"), PCWSTR::null()) {
             let mut r = RECT::default();
             if IsWindowVisible(tray).as_bool() && GetWindowRect(tray, &mut r).is_ok() {
-                tray_left = r.left;
+                tray_rect = Some(r);
             }
         }
         let count = counts.iter().find(|m| m.0 == hmon).map_or(0, |m| m.1);
@@ -14369,7 +14415,7 @@ unsafe fn taskbars_sync() {
         let target = taskbar_strip_rect(
             monitor,
             taskbar,
-            tray_left,
+            tray_rect,
             TASKBAR_OFFSET.load(Ordering::Relaxed),
             count,
             BAR_CELL.load(Ordering::Relaxed) as i32,
@@ -14432,6 +14478,15 @@ unsafe fn taskbars_sync() {
             }
         }
         let h = hwnd_from(t.bar.hwnd);
+        let vertical = taskbar_vertical(taskbar) as isize;
+        let orientation_changed = GetWindowLongPtrW(h, TASKBAR_AXIS) != vertical;
+        SetWindowLongPtrW(h, TASKBAR_AXIS, vertical);
+        if orientation_changed {
+            // Do not route a click through the previous axis before repaint.
+            if let Some(layouts) = BAR_LAYOUTS.lock().unwrap().as_mut() {
+                layouts.remove(&t.bar.hwnd);
+            }
+        }
         // Reassert only this small overlay's Z-order, not Explorer's. The shell
         // raises its taskbar on reveal; unchanged placement needs no repaint.
         if let Err(e) = SetWindowPos(
@@ -14449,7 +14504,7 @@ unsafe fn taskbars_sync() {
             t.error = Some("place");
             continue;
         }
-        if t.rect != Some(rect) {
+        if t.rect != Some(rect) || orientation_changed {
             let _ = InvalidateRect(h, None, BOOL(0));
         }
         t.rect = Some(rect);
@@ -15521,6 +15576,7 @@ fn bar_data_from(cfg: &Config, light: bool, tiling: bool, mons: Vec<MonBar>) -> 
             .any(|z| z.contains(&BarWidget::MediaControls));
     BarData {
         taskbar: false,
+        taskbar_vertical: false,
         bg: r.bg,
         fg: r.fg,
         accent: r.accent,
@@ -16271,7 +16327,16 @@ unsafe fn draw_workspaces(cv: &BarCanvas, it: &BarItem, data: &BarData, mb: &Mon
         return;
     }
     let spans = mark_spans(it.x, &it.marks[..n]);
-    let (hdc, h_px, ws, dpi) = (cv.hdc, cv.h, data.style.ws, bar_dpi());
+    let vertical = data.taskbar_vertical;
+    let (hdc, h_px, ws, dpi) = (
+        cv.hdc,
+        if vertical { cv.w } else { cv.h },
+        data.style.ws,
+        bar_dpi(),
+    );
+    let shape = |r, radius, color| {
+        cv.shape(axis_bounds(r, vertical), radius, Some(color), None);
+    };
     let ipad = (h_px / 6).clamp(2, 6);
     let pos = match pill_anim_pos(mb.hmon) {
         Some((pos, _)) => Some(pos),
@@ -16296,6 +16361,9 @@ unsafe fn draw_workspaces(cv: &BarCanvas, it: &BarItem, data: &BarData, mb: &Mon
             right: r,
             bottom: h_px,
         };
+        if vertical {
+            cr = transpose_rect(cr);
+        }
         let iw = mark_icons_w(mb, i, dpi);
         if iw > 0 {
             // The label then its app icons, centred together.
@@ -16337,13 +16405,13 @@ unsafe fn draw_workspaces(cv: &BarCanvas, it: &BarItem, data: &BarData, mb: &Mon
             for (i, &(a, b)) in spans.iter().enumerate() {
                 let cx = (a + b) as f32 / 2.0;
                 let dot = [cx - d / 2.0, cy - d / 2.0, cx + d / 2.0, cy + d / 2.0];
-                cv.shape(dot, d, Some(resting(i)), None);
+                shape(dot, d, resting(i));
             }
             if let Some((a, b)) = mark {
                 let pw = (d * 2.6).min((b - a) as f32 - 4.0).max(d);
                 let cx = ((a + b) / 2.0) as f32;
                 let mark = [cx - pw / 2.0, cy - d / 2.0, cx + pw / 2.0, cy + d / 2.0];
-                cv.shape(mark, d, Some(data.accent), None);
+                shape(mark, d, data.accent);
             }
         }
         WsStyle::Underline => {
@@ -16358,11 +16426,10 @@ unsafe fn draw_workspaces(cv: &BarCanvas, it: &BarItem, data: &BarData, mb: &Mon
                 let uh = (h_px as f32 / 14.0).round().max(2.0);
                 let bottom = (h_px - (ipad / 2).max(1)) as f32;
                 let cx = ((a + b) / 2.0) as f32;
-                cv.shape(
+                shape(
                     [cx - uw / 2.0, bottom - uh, cx + uw / 2.0, bottom],
                     uh,
-                    Some(data.accent),
-                    None,
+                    data.accent,
                 );
             }
         }
@@ -16382,10 +16449,18 @@ unsafe fn draw_workspaces(cv: &BarCanvas, it: &BarItem, data: &BarData, mb: &Mon
                 } else {
                     0.0
                 };
-                cv.shape(mark, radius, Some(data.accent), None);
+                shape(mark, radius, data.accent);
                 label(i, a.round() as i32, b.round() as i32, data.style.accent_fg);
             }
         }
+    }
+}
+
+fn axis_bounds(r: [f32; 4], vertical: bool) -> [f32; 4] {
+    if vertical {
+        [r[1], r[0], r[3], r[2]]
+    } else {
+        r
     }
 }
 
@@ -16519,6 +16594,7 @@ fn bar_hits(
         _ => data.bg,
     };
     let mut lay = BarLayout {
+        vertical: data.taskbar_vertical,
         hover: st.hover,
         ..Default::default()
     };
@@ -17162,7 +17238,11 @@ unsafe fn paint_bar(h: HWND, taskbar: bool) {
     let win_hdc = BeginPaint(h, &mut ps);
     let hmon = GetWindowLongPtrW(h, GWLP_USERDATA);
     let data = BAR.lock().unwrap().clone();
-    let data = if taskbar { taskbar_data(data) } else { data };
+    let data = if taskbar {
+        taskbar_data(data, GetWindowLongPtrW(h, TASKBAR_AXIS) != 0)
+    } else {
+        data
+    };
 
     let mut rc = RECT::default();
     let _ = GetClientRect(h, &mut rc);
@@ -17177,7 +17257,7 @@ unsafe fn paint_bar(h: HWND, taskbar: bool) {
         w,
         h: h_px,
     };
-    // The pointer's x on this bar (client px), if it is over it.
+    // The pointer's position along this bar, in client px.
     let pointer_x = {
         let mut cursor = POINT::default();
         let mut window = RECT::default();
@@ -17187,7 +17267,11 @@ unsafe fn paint_bar(h: HWND, taskbar: bool) {
             && cursor.x < window.right
             && cursor.y >= window.top
             && cursor.y < window.bottom)
-            .then_some(cursor.x - window.left)
+            .then_some(if data.taskbar_vertical {
+                cursor.y - window.top
+            } else {
+                cursor.x - window.left
+            })
     }
     .filter(|_| BAR_HOVER_HWND.load(Ordering::Relaxed) == h.0 as isize);
     let hovered = match pointer_x {
@@ -17271,6 +17355,29 @@ unsafe fn render_bar(
         },
         dpi,
     );
+    if data.taskbar_vertical {
+        let mb = data.mons.iter().find(|m| m.hmon == hmon);
+        let mut it = bar_measure(cv, BarWidget::Workspaces, data, mb, cell, h_px, fonts);
+        it.x = pad;
+        let lay = bar_hits([std::slice::from_ref(&it), &[], &[]], data, mb, 0, 0, 0);
+        if let Some((_, (a, b), under)) = pointer_x
+            .filter(|_| data.style.hover)
+            .and_then(|p| hover_target(&lay, mb.map_or(usize::MAX, |m| m.active), p))
+        {
+            let inset = (w / 6).clamp(2, 6) as f32;
+            cv.shape(
+                [inset, a as f32, w as f32 - inset, b as f32],
+                dpi_px(6, dpi) as f32,
+                Some(blend_px(under, data.fg, 0.12)),
+                None,
+            );
+        }
+        if let Some(mb) = mb {
+            draw_workspaces(cv, &it, data, mb);
+        }
+        SelectObject(hdc, old_font);
+        return lay;
+    }
     // Joined powerline segments sit an arrow's length apart.
     let gap = match powerline_pills(&data.style) {
         true => powerline_cap(h_px),
@@ -17429,6 +17536,11 @@ fn bar_release_pairs(h: isize, button: u8) -> bool {
     BAR_PRESS.take() == Some((h, button))
 }
 
+fn bar_pointer_axis(l: LPARAM, vertical: bool) -> i32 {
+    let shift = if vertical { 16 } else { 0 };
+    ((l.0 as u32 >> shift) & 0xFFFF) as i16 as i32
+}
+
 /// Bar WndProc: paints on demand, ticks the clock, and switches that monitor's
 /// workspace when a pill is clicked.
 unsafe extern "system" fn bar_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -17532,7 +17644,6 @@ unsafe extern "system" fn bar_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            let x = (l.0 as u32 & 0xFFFF) as i16 as i32;
             // The app button under the pointer (its tooltip) and, with
             // `hover` on, the highlight's target: a move repaints only when
             // either changes, never per pixel.
@@ -17542,6 +17653,7 @@ unsafe extern "system" fn bar_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 .as_ref()
                 .and_then(|m| m.get(&(h.0 as isize)))
                 .map(|lay| {
+                    let x = bar_pointer_axis(l, lay.vertical);
                     let app = (lay.apps.iter())
                         .find(|(x0, x1, _)| x >= *x0 && x < *x1)
                         .map_or(0, |(_, _, hwnd)| *hwnd);
@@ -17601,7 +17713,6 @@ unsafe extern "system" fn bar_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             // volume widget's default) toggles it at once. Every other
             // action runs on the button's release, below.
             BAR_PRESS.set(Some((h.0 as isize, 0)));
-            let x = (l.0 as u32 & 0xFFFF) as i16 as i32;
             let hmon = GetWindowLongPtrW(h, GWLP_USERDATA);
             let lay = BAR_LAYOUTS
                 .lock()
@@ -17609,6 +17720,7 @@ unsafe extern "system" fn bar_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 .as_ref()
                 .and_then(|m| m.get(&(h.0 as isize)).cloned())
                 .unwrap_or_default();
+            let x = bar_pointer_axis(l, lay.vertical);
             let mute = action_index("mute");
             if let Some(pill) = lay.pills.iter().position(|&(a, b)| x >= a && x < b) {
                 // Map the clicked pill back to its real local workspace via slots
@@ -17639,7 +17751,6 @@ unsafe extern "system" fn bar_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         // The manager resolves the action (Cmd::BarAction); returning 0 for
         // the right button keeps DefWindowProc from raising a context menu.
         WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP => {
-            let x = (l.0 as u32 & 0xFFFF) as i16 as i32;
             let button = match msg {
                 WM_LBUTTONUP => 0,
                 WM_RBUTTONUP => 1,
@@ -17653,7 +17764,10 @@ unsafe extern "system" fn bar_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 .unwrap()
                 .as_ref()
                 .and_then(|m| m.get(&(h.0 as isize)))
-                .and_then(|lay| lay.hits.iter().find(|t| x >= t.x0 && x < t.x1).copied());
+                .and_then(|lay| {
+                    let x = bar_pointer_axis(l, lay.vertical);
+                    lay.hits.iter().find(|t| x >= t.x0 && x < t.x1).copied()
+                });
             if let Some(t) = hit {
                 let act = t.acts[button];
                 // A left-click mute already ran on the press.
@@ -27966,7 +28080,7 @@ mod tests {
                 }
                 let data = bar_data_from(&cfg, *light, true, vec![m]);
                 let data = if cfg.taskbar_workspaces {
-                    taskbar_data(data)
+                    taskbar_data(data, false)
                 } else {
                     data
                 };
@@ -29473,30 +29587,112 @@ mod tests {
     fn taskbar_strip_fits_each_dpi_and_never_partially_covers_the_tray() {
         let monitor = rect(-1920, -1080, 0, 0);
         let bottom = rect(-1920, -48, 0, 0);
+        let tray = Some(rect(-160, -48, 0, 0));
         assert_eq!(
-            taskbar_strip_rect(monitor, bottom, -160, 180, 5, 34, 96).unwrap(),
+            taskbar_strip_rect(monitor, bottom, tray, 180, 5, 34, 96).unwrap(),
             Some(rect(-1740, -38, -1562, -10)),
         );
         let top = rect(-1920, -1080, 0, -1008);
         assert_eq!(
-            taskbar_strip_rect(monitor, top, -240, 180, 5, 34, 144).unwrap(),
+            taskbar_strip_rect(monitor, top, None, 180, 5, 34, 144).unwrap(),
             Some(rect(-1650, -1065, -1383, -1023)),
         );
-        assert!(taskbar_strip_rect(monitor, bottom, -1600, 180, 5, 34, 96).is_err());
-        assert!(taskbar_strip_rect(monitor, bottom, 0, 1900, 5, 34, 96).is_err());
+        assert!(taskbar_strip_rect(
+            monitor,
+            bottom,
+            Some(rect(-1600, -48, 0, 0)),
+            180,
+            5,
+            34,
+            96
+        )
+        .is_err());
+        assert!(taskbar_strip_rect(monitor, bottom, tray, 1900, 5, 34, 96).is_err());
         assert_eq!(
-            taskbar_strip_rect(monitor, bottom, 0, 180, 0, 34, 96).unwrap(),
+            taskbar_strip_rect(monitor, bottom, tray, 180, 0, 34, 96).unwrap(),
             None,
         );
         for hidden in [rect(-1920, -2, 0, 46), rect(-1920, -1126, 0, -1078)] {
             assert_eq!(
-                taskbar_strip_rect(monitor, hidden, 0, 180, 5, 34, 96).unwrap(),
+                taskbar_strip_rect(monitor, hidden, None, 180, 5, 34, 96).unwrap(),
                 None,
             );
         }
-        assert!(
-            taskbar_strip_rect(monitor, rect(-1920, -1080, -1872, 0), 0, 180, 5, 34, 96).is_err()
-        );
+    }
+
+    #[test]
+    fn taskbar_strip_handles_all_edges_autohide_and_full_tray_rectangles() {
+        let monitor = rect(-1920, -1080, 0, 0);
+        for dpi in [96, 144, 192] {
+            let pad = dpi_px(TASKBAR_PAD, dpi);
+            let offset = dpi_px(180, dpi);
+            let length = 5 * dpi_px(34, dpi) + 2 * pad;
+            for bar in [
+                rect(-1920, -1080, -1824, 0),
+                rect(-96, -1080, 0, 0),
+                rect(-1920, -1080, 0, -984),
+                rect(-1920, -96, 0, 0),
+            ] {
+                let vertical = taskbar_vertical(bar);
+                let strip = taskbar_strip_rect(monitor, bar, None, 180, 5, 34, dpi)
+                    .unwrap()
+                    .unwrap();
+                if vertical {
+                    assert_eq!(
+                        strip,
+                        rect(
+                            bar.left + pad,
+                            bar.top + offset,
+                            bar.right - pad,
+                            bar.top + offset + length
+                        )
+                    );
+                } else {
+                    assert_eq!(strip.left, bar.left + offset);
+                    assert_eq!(strip.right - strip.left, length);
+                    assert_eq!(strip.bottom - strip.top, dpi_px(TASKBAR_HEIGHT, dpi));
+                }
+                // A tray on either end of the strip, not merely to its right.
+                for tray in [
+                    strip,
+                    rect(
+                        strip.left - 10,
+                        strip.top - 10,
+                        strip.left + 1,
+                        strip.top + 1,
+                    ),
+                    rect(
+                        strip.right - 1,
+                        strip.bottom - 1,
+                        strip.right + 10,
+                        strip.bottom + 10,
+                    ),
+                ] {
+                    assert!(taskbar_strip_rect(monitor, bar, Some(tray), 180, 5, 34, dpi).is_err());
+                }
+                // Sharing an axis range alone is not a two-dimensional overlap.
+                for tray in [
+                    rect(strip.left, strip.bottom, strip.right, strip.bottom + 20),
+                    rect(strip.right, strip.top, strip.right + 20, strip.bottom),
+                ] {
+                    assert_eq!(
+                        taskbar_strip_rect(monitor, bar, Some(tray), 180, 5, 34, dpi).unwrap(),
+                        Some(strip)
+                    );
+                }
+            }
+            for hidden in [
+                rect(-2014, -1080, -1918, 0),
+                rect(-2, -1080, 94, 0),
+                rect(-1920, -1174, 0, -1078),
+                rect(-1920, -2, 0, 94),
+            ] {
+                assert_eq!(
+                    taskbar_strip_rect(monitor, hidden, None, 180, 5, 34, dpi).unwrap(),
+                    None
+                );
+            }
+        }
     }
 
     #[test]
@@ -29505,6 +29701,7 @@ mod tests {
         mgr.cfg.bar_enabled = false;
         mgr.cfg.taskbar_workspaces = true;
         mgr.cfg.bar_hide_empty = true;
+        mgr.cfg.bar_hover = true;
         mgr.cfg.per_monitor = true;
         mgr.cfg.bar_workspace_label = "name".into();
         mgr.cfg.workspace_names = ["Web", "Code", "Chat", "Other"].map(String::from).to_vec();
@@ -29518,7 +29715,7 @@ mod tests {
         for m in &mgr.monitors {
             assert_eq!(m.work_area, m.base_work);
         }
-        let data = taskbar_data(BAR.lock().unwrap().clone());
+        let data = taskbar_data(BAR.lock().unwrap().clone(), false);
         assert_eq!(data.left, [BarWidget::Workspaces]);
         assert!(data.center.is_empty() && data.right.is_empty());
         assert_eq!(data.mons[0].slots, [0, 2]);
@@ -29533,6 +29730,7 @@ mod tests {
             let class = w!("astur_taskbar_test");
             let wc = WNDCLASSW {
                 lpfnWndProc: Some(taskbar_wndproc),
+                cbWndExtra: std::mem::size_of::<isize>() as i32,
                 hInstance: inst,
                 lpszClassName: class,
                 ..Default::default()
@@ -29556,10 +29754,20 @@ mod tests {
             let hmon = mgr.monitors[0].hmon;
             SetWindowLongPtrW(h, GWLP_USERDATA, hmon);
             let screen = GetDC(None);
-            for dpi in [96, 144, 192] {
+            for (dpi, vertical) in [96, 144, 192]
+                .into_iter()
+                .flat_map(|dpi| [(dpi, false), (dpi, true)])
+            {
+                let data = taskbar_data(data.clone(), vertical);
+                SetWindowLongPtrW(h, TASKBAR_AXIS, vertical as isize);
                 BAR_PAINT_DPI.store(dpi, Ordering::Relaxed);
-                let w = 2 * dpi_px(34, dpi) + 2 * dpi_px(TASKBAR_PAD, dpi);
-                let dib = new_bar_dib(screen, w, dpi_px(TASKBAR_HEIGHT, dpi)).unwrap();
+                let length = 2 * dpi_px(34, dpi) + 2 * dpi_px(TASKBAR_PAD, dpi);
+                let (w, height) = if vertical {
+                    (dpi_px(72, dpi), length)
+                } else {
+                    (length, dpi_px(TASKBAR_HEIGHT, dpi))
+                };
+                let dib = new_bar_dib(screen, w, height).unwrap();
                 let cv = BarCanvas {
                     hdc: HDC(dib.dc as *mut c_void),
                     bits: dib.bits as *mut u32,
@@ -29567,21 +29775,116 @@ mod tests {
                     h: dib.h,
                 };
                 let lay = render_bar(&cv, &data, hmon, dpi, 0, None);
+                assert_eq!(lay.vertical, vertical);
                 assert_eq!(
                     lay.pills,
                     mark_spans(dpi_px(TASKBAR_PAD, dpi), &[dpi_px(34, dpi); 2])
                 );
                 assert!(lay.apps.is_empty());
-                let x = lay.pills[1].0 + 1;
+                if vertical {
+                    let mut upright = data.clone();
+                    upright.style.ws = WsStyle::Underline;
+                    let mb = upright.mons.iter_mut().find(|m| m.hmon == hmon).unwrap();
+                    mb.labels = vec!["Ab".into()];
+                    mb.active = usize::MAX;
+                    render_bar(&cv, &upright, hmon, dpi, 0, None);
+                    let cell = dpi_px(34, dpi);
+                    let pad = dpi_px(TASKBAR_PAD, dpi);
+                    let reference = new_bar_dib(screen, w, cell).unwrap();
+                    let ref_cv = BarCanvas {
+                        hdc: HDC(reference.dc as *mut c_void),
+                        bits: reference.bits as *mut u32,
+                        w,
+                        h: cell,
+                    };
+                    ref_cv.clear(upright.bg);
+                    let font = HGDIOBJ(tab_font_for(dpi, TASKBAR_HEIGHT) as *mut c_void);
+                    let old_font = SelectObject(ref_cv.hdc, font);
+                    SetBkMode(ref_cv.hdc, TRANSPARENT);
+                    let mb = upright.mons.iter().find(|m| m.hmon == hmon);
+                    let mut it = bar_measure(
+                        &ref_cv,
+                        BarWidget::Workspaces,
+                        &upright,
+                        mb,
+                        w,
+                        w,
+                        [font; 3],
+                    );
+                    upright.taskbar_vertical = false;
+                    it.x = 0;
+                    draw_workspaces(&ref_cv, &it, &upright, mb.unwrap());
+                    assert!(GdiFlush().as_bool());
+                    // The vertical cell must contain exactly the upright
+                    // horizontal label, not a rotated text bitmap.
+                    let expected = std::slice::from_raw_parts(ref_cv.bits, (w * cell) as usize);
+                    let actual = std::slice::from_raw_parts(
+                        cv.bits.add((w * pad) as usize),
+                        (w * cell) as usize,
+                    );
+                    assert!(expected
+                        .iter()
+                        .any(|&p| p & 0xFFFFFF != px_color(upright.bg) & 0xFFFFFF));
+                    assert_eq!(actual, expected);
+                    SelectObject(ref_cv.hdc, old_font);
+                    SelectObject(ref_cv.hdc, HGDIOBJ(reference.old as *mut c_void));
+                    let _ = DeleteObject(HGDIOBJ(reference.bmp as *mut c_void));
+                    let _ = DeleteDC(ref_cv.hdc);
+
+                    let mut sliding = data.clone();
+                    sliding.style.ws = WsStyle::Box;
+                    sliding
+                        .mons
+                        .iter_mut()
+                        .for_each(|m| m.labels.fill(" ".into()));
+                    PILL_ANIM
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(HashMap::new)
+                        .insert(
+                            hmon,
+                            PillAnim {
+                                from: 0.5,
+                                to_i: 1,
+                                // Freeze at the midpoint without depending on test timing.
+                                start: Instant::now() + std::time::Duration::from_secs(60),
+                            },
+                        );
+                    render_bar(&cv, &sliding, hmon, dpi, 0, None);
+                    assert!(GdiFlush().as_bool());
+                    let pixels = std::slice::from_raw_parts(cv.bits, (w * height) as usize);
+                    assert_eq!(
+                        pixels[((pad + cell) * w + w / 2) as usize],
+                        px_color(sliding.accent),
+                    );
+                    assert_eq!(
+                        pixels[((pad + cell / 4) * w + w / 2) as usize],
+                        px_color(sliding.bg),
+                    );
+                    pill_anim_clear(hmon);
+                }
+                let p = lay.pills[0].0 + 1;
+                assert!(hover_target(&lay, 1, p).is_some());
+                render_bar(&cv, &data, hmon, dpi, 0, Some(p));
+                let pill_start = lay.pills[1].0;
+                let p = pill_start + 1;
+                let point = if vertical {
+                    (p << 16) | 1
+                } else {
+                    (1 << 16) | p
+                };
                 BAR_LAYOUTS
                     .lock()
                     .unwrap()
                     .get_or_insert_with(HashMap::new)
                     .insert(h.0 as isize, lay);
-                taskbar_wndproc(h, WM_LBUTTONDOWN, WPARAM(0), LPARAM(x as isize));
+                taskbar_wndproc(h, WM_LBUTTONDOWN, WPARAM(0), LPARAM(point as isize));
                 assert!(
                     matches!(CMDQ.lock().unwrap().pop_back(), Some(Cmd::BarClick(m, 2)) if m == hmon)
                 );
+                taskbar_wndproc(h, WM_MOUSEMOVE, WPARAM(0), LPARAM(point as isize));
+                assert_eq!(BAR_HOVER_ID.load(Ordering::Relaxed), pill_start as i64);
+                taskbar_wndproc(h, WM_MOUSELEAVE, WPARAM(0), LPARAM(0));
                 let _ = GdiFlush();
                 SelectObject(cv.hdc, HGDIOBJ(dib.old as *mut c_void));
                 let _ = DeleteObject(HGDIOBJ(dib.bmp as *mut c_void));
