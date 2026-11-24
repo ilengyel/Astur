@@ -161,7 +161,7 @@ pub struct Config {
     pub window_rules: Vec<WindowRule>,
     pub bar_enabled: bool,         // draw the status bar on every monitor
     pub taskbar_workspaces: bool,  // workspace-only overlay on the Windows taskbar
-    pub taskbar_offset: i32,       // logical px from the taskbar's left edge
+    pub taskbar_offset: i32,       // logical px from the taskbar's left/top edge
     pub bar_height: i32,           // bar thickness in px (work area is reserved for it)
     pub bar_bottom: bool,          // dock the bar at the bottom instead of the top
     pub bar_font_size: i32,        // text height in px; 0 = auto from bar_height
@@ -1923,13 +1923,15 @@ const DEFAULT_NAVBAR: &str = "\
 # Show the full status bars. bool (taskbar_workspaces is independent)
 enabled = true
 # Workspace-only overlay on the Windows taskbar, independent of enabled.
-# Set enabled = false to replace the top bar. Horizontal taskbars only.
+# Set enabled = false to replace the top bar. Supports all four taskbar edges.
 # No space is reserved in Explorer: adjust offset to an unused area.
 # Reuses monitors, workspace labels/style/width, hide-empty and wheel settings.
-# Long labels are clipped to workspace_width; app icons are not shown.
+# Vertical taskbars stack upright labels in taskbar-width buttons.
+# workspace_width sets cell width horizontally, height vertically.
+# Long labels are clipped to the button; app icons are not shown.
 taskbar_workspaces = false
-# Distance from each taskbar's left edge, in logical px. int 0 - 10000
-# For low offsets, set Windows taskbar alignment to Center.
+# Distance from the left edge, or top on vertical taskbars. int 0 - 10000
+# For low horizontal offsets, set Windows taskbar alignment to Center.
 taskbar_offset = 0
 # Bar thickness in pixels.  int 0 - 200  (0 also disables it)
 height = 28
